@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RateRadar</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c2430; --muted:#6b7686; --line:#e4e7ec; --accent:#2f5bea;
+          --low:#2e7d6b; --med:#b7791f; --high:#c0392b; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12161c; --card:#1a2028; --text:#e6e9ee; --muted:#8c97a7; --line:#2a323d; --accent:#6c8cff;
+            --low:#4fc3a1; --med:#e0a73a; --high:#ef6b5b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui, sans-serif; background:var(--bg); color:var(--text); }
+  header { display:flex; align-items:center; justify-content:space-between; padding:16px 24px; border-bottom:1px solid var(--line); background:var(--card); }
+  h1 { font-size:18px; margin:0; } h1 span { color:var(--muted); font-weight:400; font-size:13px; margin-left:8px; }
+  main { max-width:1100px; margin:0 auto; padding:20px; display:grid; gap:20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; overflow-x:auto; }
+  .card h2 { font-size:15px; margin:0 0 12px; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  table { width:100%; border-collapse:collapse; } th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:500; font-size:12px; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:99px; font-size:12px; font-weight:600; border:1px solid currentColor; }
+  .low { color:var(--low); } .medium { color:var(--med); } .high { color:var(--high); }
+  .ok { color:var(--low); } .stale, .warn { color:var(--med); } .fail { color:var(--high); }
+  button, select, input { font:inherit; padding:6px 12px; border-radius:6px; border:1px solid var(--line); background:var(--card); color:var(--text); }
+  button { cursor:pointer; } button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button:disabled { opacity:.5; cursor:default; }
+  input[type=number] { width:70px; }
+  .row-actions { display:flex; gap:6px; white-space:nowrap; }
+  .reason { color:var(--muted); font-size:12px; max-width:380px; }
+  .spacer { flex:1; }
+  #toast { position:fixed; bottom:20px; right:20px; padding:10px 16px; border-radius:8px; background:var(--text); color:var(--bg); opacity:0; transition:opacity .2s; max-width:340px; }
+  #toast.show { opacity:1; }
+  .empty { color:var(--muted); padding:12px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>RateRadar <span>mini revenue management</span></h1>
+  <div id="health">checking feed...</div>
+</header>
+<main>
+  <section class="card">
+    <h2>Competitor rates (next 14 days)</h2>
+    <table id="rates"><thead><tr><th>Date</th><th>Avg (Rs)</th><th>Min</th><th>Max</th><th>Hotels with rooms</th></tr></thead><tbody></tbody></table>
+  </section>
+
+  <section class="card">
+    <h2>
+      Recommendations
+      <span class="spacer"></span>
+      <select id="filter">
+        <option value="pending">Pending</option>
+        <option value="">All</option>
+        <option value="approved">Approved</option>
+        <option value="rejected">Rejected</option>
+        <option value="push_failed">Push failed</option>
+      </select>
+      <label>Days <input id="days" type="number" min="1" max="60" value="14"></label>
+      <button id="generate" class="primary">Generate</button>
+    </h2>
+    <table id="recs"><thead><tr><th>Date</th><th>Demand</th><th>Comp avg</th><th>Rate (Rs)</th><th>Why</th><th>Status</th><th></th></tr></thead><tbody></tbody></table>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const fmt = (n) => Number(n).toLocaleString("en-IN");
+
+function toast(msg) {
+  const t = $("#toast"); t.textContent = msg; t.classList.add("show");
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove("show"), 3500);
+}
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || body.issue || res.statusText);
+  return body;
+}
+
+function cell(tr, text, cls) {
+  const td = document.createElement("td");
+  if (cls) { const s = document.createElement("span"); s.className = cls; s.textContent = text; td.appendChild(s); }
+  else td.textContent = text;
+  tr.appendChild(td); return td;
+}
+
+async function loadHealth() {
+  const el = $("#health");
+  try {
+    const h = await fetch("/health").then(r => r.json());
+    el.textContent = "";
+    const b = document.createElement("span"); b.className = "badge " + h.status; b.textContent = "feed " + h.status;
+    el.appendChild(b);
+    if (h.hotels) el.append(` ${h.hotels} hotels, ${h.days_covered} days, ${h.feed_age_hours}h old`);
+    else if (h.issue) el.append(" " + h.issue);
+  } catch (e) { el.textContent = "API unreachable"; }
+}
+
+async function loadRates() {
+  const body = $("#rates tbody"); body.textContent = "";
+  try {
+    const rows = await api("/rates");
+    if (!rows.length) { body.innerHTML = '<tr><td colspan="5" class="empty">No data. Run the crawler and pipeline.</td></tr>'; return; }
+    for (const r of rows) {
+      const tr = document.createElement("tr");
+      cell(tr, r.stay_date); cell(tr, fmt(r.avg)); cell(tr, fmt(r.min)); cell(tr, fmt(r.max)); cell(tr, r.hotels);
+      body.appendChild(tr);
+    }
+  } catch (e) { toast(e.message); }
+}
+
+async function act(id, action, btns) {
+  btns.forEach(b => b.disabled = true);
+  try {
+    await api(`/recommendations/${id}/${action}`, { method: "POST" });
+    toast(action === "approve" ? "Approved and pushed to PMS" : "Rejected");
+  } catch (e) { toast(e.message); }
+  loadRecs();
+}
+
+async function loadRecs() {
+  const body = $("#recs tbody"); body.textContent = "";
+  const status = $("#filter").value;
+  try {
+    const rows = await api("/recommendations" + (status ? `?status=${status}` : ""));
+    if (!rows.length) { body.innerHTML = '<tr><td colspan="7" class="empty">Nothing here. Click Generate.</td></tr>'; return; }
+    for (const r of rows) {
+      const tr = document.createElement("tr");
+      cell(tr, r.stay_date);
+      const d = cell(tr, "", null); const s = document.createElement("span"); s.className = "badge " + r.demand; s.textContent = r.demand; d.appendChild(s);
+      cell(tr, fmt(r.comp_avg));
+      const rate = cell(tr, fmt(r.recommended_rate)); rate.style.fontWeight = 600;
+      const why = cell(tr, r.reason); why.className = "reason";
+      cell(tr, r.status.replace("_", " "));
+      const act_td = document.createElement("td"); act_td.className = "row-actions";
+      if (r.status === "pending" || r.status === "push_failed") {
+        const a = document.createElement("button"); a.textContent = r.status === "push_failed" ? "Retry" : "Approve"; a.className = "primary";
+        const x = document.createElement("button"); x.textContent = "Reject";
+        a.onclick = () => act(r.id, "approve", [a, x]);
+        x.onclick = () => act(r.id, "reject", [a, x]);
+        act_td.appendChild(a); if (r.status === "pending") act_td.appendChild(x);
+      }
+      tr.appendChild(act_td); body.appendChild(tr);
+    }
+  } catch (e) { toast(e.message); }
+}
+
+$("#generate").onclick = async () => {
+  const btn = $("#generate"); btn.disabled = true;
+  try {
+    const days = Math.min(Math.max(parseInt($("#days").value) || 14, 1), 60);
+    const res = await api("/recommendations/generate", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ days })
+    });
+    toast(`Created ${res.created} recommendations`);
+    $("#filter").value = "pending";
+  } catch (e) { toast(e.message); }
+  btn.disabled = false; loadRecs();
+};
+$("#filter").onchange = loadRecs;
+
+loadHealth(); loadRates(); loadRecs();
+</script>
+</body>
+</html>
